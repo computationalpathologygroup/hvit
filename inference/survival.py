@@ -39,7 +39,7 @@ def main(cfg: DictConfig):
         log_to_wandb = {k: v for e in cfg.wandb.to_log for k, v in e.items()}
         run_id = wandb_run.id
 
-    output_dir = Path(cfg.output_dir, cfg.experiment_name, run_id)
+    output_dir = Path(cfg.output_dir, cfg.experiment_name, "single")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_dir = Path(output_dir, "checkpoints", cfg.level)

@@ -57,7 +57,12 @@ def main(cfg: DictConfig):
         )
         run_id = obj[0]
 
-    output_dir = Path(cfg.output_dir, cfg.experiment_name, run_id)
+    output_dir = Path(cfg.output_dir, cfg.experiment_name)
+    if cfg.fold:
+        output_dir = Path(output_dir, "multi", f"fold_{cfg.fold}")
+    else:
+        output_dir = Path(output_dir, "single")
+
     slide_features_dir = Path(output_dir, "slide_features")
     region_features_dir = Path(output_dir, "region_features")
     if not cfg.resume and is_main_process():
