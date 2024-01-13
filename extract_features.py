@@ -58,7 +58,7 @@ def main(cfg: DictConfig):
         run_id = obj[0]
 
     output_dir = Path(cfg.output_dir, cfg.experiment_name)
-    if cfg.fold:
+    if cfg.fold is not None:
         output_dir = Path(output_dir, "multi", f"fold_{cfg.fold}")
     else:
         output_dir = Path(output_dir, "single")
