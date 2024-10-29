@@ -3,6 +3,7 @@ import torch
 import random
 import numpy as np
 import pandas as pd
+import wholeslidedata as wsd
 
 from PIL import Image
 from pathlib import Path
@@ -140,12 +141,11 @@ class ClassificationDatasetOptions:
 
 @dataclass
 class SurvivalDatasetOptions:
-    patient_df: pd.DataFrame
-    slide_df: pd.DataFrame
-    tiles_df: pd.DataFrame
+    df: pd.DataFrame
     features_dir: Path
     label_name: str
     transform: Optional[Callable] = (None,)
+    nfeats_max: Optional[int] = None
 
 
 class DatasetFactory:
@@ -196,7 +196,8 @@ class DatasetFactory:
                     options.label_mapping,
                 )
         elif task == "survival":
-            if options.tiles_df is not None:
+            # if options.tiles_df is not None:
+            if False:
                 if agg_method == "concat":
                     self.dataset = ExtractedFeaturesCoordsSurvivalDataset(
                         options.patient_df,
@@ -214,26 +215,12 @@ class DatasetFactory:
                         options.label_name,
                     )
             else:
-                if agg_method == "concat":
-                    self.dataset = ExtractedFeaturesSurvivalDataset(
-                        options.patient_df,
-                        options.slide_df,
-                        options.features_dir,
-                        options.label_name,
-                    )
-                elif agg_method == "self_att":
-                    self.dataset = ExtractedFeaturesPatientLevelSurvivalDataset(
-                        options.patient_df,
-                        options.slide_df,
-                        options.features_dir,
-                        options.label_name,
-                    )
-                elif not agg_method:
-                    self.dataset = ExtractedFeaturesSlideLevelSurvivalDataset(
-                        options.slide_df,
-                        options.features_dir,
-                        options.label_name,
-                    )
+                self.dataset = ExtractedFeaturesSurvivalDataset(
+                    options.df,
+                    options.features_dir,
+                    options.label_name,
+                    options.nfeats_max,
+                )
         else:
             raise ValueError(f"task ({task}) not supported")
 
@@ -294,7 +281,7 @@ class ExtractedFeaturesDataset(torch.utils.data.Dataset):
         row = self.df.loc[idx]
         slide_id = row.slide_id
         fp = Path(self.features_dir, f"{slide_id}.pt")
-        features = torch.load(fp)
+        features = torch.load(fp, map_location='cpu')
         label = row.label
         if self.transform:
             features = self.transform(features, slide_id, self.seed)
@@ -319,7 +306,7 @@ class ExtractedFeaturesOrdinalDataset(ExtractedFeaturesDataset):
         row = self.df.loc[idx]
         slide_id = row.slide_id
         fp = Path(self.features_dir, f"{slide_id}.pt")
-        features = torch.load(fp)
+        features = torch.load(fp, map_location='cpu')
         label = np.zeros(self.num_classes - 1).astype(np.float32)
         label[: row.label] = 1.0
         if self.transform:
@@ -359,7 +346,7 @@ class BlindedExtractedFeaturesDataset(torch.utils.data.Dataset):
         row = self.df.loc[idx]
         slide_id = row.slide_id
         fp = Path(self.features_dir, f"{slide_id}.pt")
-        features = torch.load(fp)
+        features = torch.load(fp, map_location='cpu')
         if self.transform:
             features = self.transform(features, slide_id, self.seed)
         return idx, features, _
@@ -371,64 +358,50 @@ class BlindedExtractedFeaturesDataset(torch.utils.data.Dataset):
 class ExtractedFeaturesSurvivalDataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        patient_df: pd.DataFrame,
-        slide_df: pd.DataFrame,
+        df: pd.DataFrame,
         features_dir: Path,
         label_name: str = "label",
-        nfeats_max: Optional[int] = 1000,
+        nfeats_max: Optional[int] = None,
     ):
         self.features_dir = features_dir
         self.label_name = label_name
-        self.use_coords = False
-        self.agg_level = "patient"
         self.nfeats_max = nfeats_max
 
         self.seed = 0
+        self.use_coords = False
 
-        self.slide_df, case_ids = self.filter_df(slide_df)
-        self.df = patient_df[patient_df.case_id.isin(case_ids)].reset_index(drop=True)
+        self.df = self.filter_df(df)
+        self.num_classes = self.df.discrete_label.nunique()
 
     def filter_df(self, df):
-        missing_slide_ids = []
-        for slide_id in df.slide_id:
-            if not Path(self.features_dir, f"{slide_id}.pt").is_file():
-                missing_slide_ids.append(slide_id)
-        if len(missing_slide_ids) > 0:
+        missing_ids = []
+        for case_id in df.case_id:
+            if not Path(self.features_dir, f"{case_id}.pt").is_file():
+                missing_ids.append(case_id)
+        if len(missing_ids) > 0:
             print(
-                f"WARNING: {len(missing_slide_ids)} slides dropped because missing on disk"
+                f"WARNING: {len(missing_ids)} cases dropped because feature missing on disk"
             )
-        filtered_df = df[~df.slide_id.isin(missing_slide_ids)].reset_index(drop=True)
-        remaining_case_ids = filtered_df.case_id.unique().tolist()
-        return filtered_df, remaining_case_ids
+        filtered_df = df[~df.case_id.isin(missing_ids)].reset_index(drop=True)
+        return filtered_df
 
     def __getitem__(self, idx: int):
         row = self.df.loc[idx]
         case_id = row.case_id
-        slide_ids = self.slide_df[
-            self.slide_df.case_id == case_id
-        ].slide_id.values.tolist()
-
-        assert len(slide_ids) == len(set(slide_ids))
-
-        label = row.disc_label
+        label = row.discrete_label
         event_time = row[self.label_name]
-        c = row.censorship
+        censored = row.censored
 
-        features = []
-        for slide_id in slide_ids:
-            fp = Path(self.features_dir, f"{slide_id}.pt")
-            f = torch.load(fp)
-            features.append(f)
-
-        # when multiple slides, concatenate region features
-        features = torch.cat(features, dim=0)
+        fp = Path(self.features_dir, f"{case_id}.pt")
+        feature = torch.load(fp, map_location='cpu')
 
         # if more than nfeats_max features, randomly sample nfeats_max features
-        if self.nfeats_max and len(features) > self.nfeats_max:
+        if self.nfeats_max and len(feature) > self.nfeats_max:
             torch.manual_seed(self.seed)
-            features = features[torch.randperm(len(features))[: self.nfeats_max]]
+            sampled_indices = torch.randperm(len(feature))[:self.nfeats_max].sort().values
+            feature = feature[sampled_indices]
 
-        return idx, features, label, event_time, c
+        return idx, feature, label, event_time, censored
 
     def __len__(self):
         return len(self.df)
@@ -460,7 +433,7 @@ class ExtractedFeaturesPatientLevelSurvivalDataset(ExtractedFeaturesSurvivalData
         features = []
         for slide_id in slide_ids:
             fp = Path(self.features_dir, f"{slide_id}.pt")
-            f = torch.load(fp)
+            f = torch.load(fp, map_location='cpu')
             features.append(f)
 
         return idx, features, label, event_time, c
@@ -538,7 +511,7 @@ class ExtractedFeaturesCoordsSurvivalDataset(torch.utils.data.Dataset):
             ].values
             for x, y in coords:
                 fp = Path(self.features_dir, f"{slide_id}_{x}_{y}.pt")
-                f = torch.load(fp)
+                f = torch.load(fp, map_location='cpu')
                 features.append(f)
                 coordinates.append((i, x, y))
         coordinates = np.array(coordinates)
@@ -595,7 +568,7 @@ class ExtractedFeaturesPatientLevelCoordsSurvivalDataset(
             ].values
             for x, y in coords:
                 fp = Path(self.features_dir, f"{slide_id}_{x}_{y}.pt")
-                f = torch.load(fp)
+                f = torch.load(fp, map_location='cpu')
                 feats.append(f)
             feats = torch.cat(feats, dim=0)
             features.append(feats)
@@ -641,7 +614,7 @@ class ExtractedFeaturesSlideLevelSurvivalDataset(torch.utils.data.Dataset):
         c = row.censorship
 
         fp = Path(self.features_dir, f"{slide_id}.pt")
-        feature = torch.load(fp)
+        feature = torch.load(fp, map_location='cpu')
 
         return idx, feature, label, event_time, c
 
@@ -802,7 +775,7 @@ class ExtractedFeaturesMaskedDataset(ExtractedFeaturesDataset):
         row = self.df.loc[idx]
         slide_id = row.slide_id
         fp = Path(self.features_dir, f"{slide_id}.pt")
-        features = torch.load(fp)
+        features = torch.load(fp, map_location='cpu')
         label = row.label
         if self.transform:
             features = self.transform(features, slide_id, self.seed)
@@ -928,7 +901,7 @@ class RegionFilepathsDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int):
         row = self.df.loc[idx]
         slide_id = row.slide_id
-        slide_dir = Path(self.region_dir, slide_id, "imgs")
+        slide_dir = Path(self.region_dir, slide_id)
         regions = [str(fp) for fp in slide_dir.glob(f"*.{self.format}")]
         return idx, regions, slide_id, None
 
@@ -955,6 +928,26 @@ class SlideFilepathsDataset(torch.utils.data.Dataset):
         return len(self.df)
 
 
+class RegionCoordinatesDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        patch_dir: Path,
+    ):
+        self.df = df
+        self.patch_dir = patch_dir
+
+    def __getitem__(self, idx: int):
+        row = self.df.loc[idx]
+        slide_id = row.slide_id
+        slide_path = row.slide_path
+        patch_coordinates = np.load(Path(self.patch_dir, f"{slide_id}.npy"))
+        return idx, slide_path, patch_coordinates
+
+    def __len__(self):
+        return len(self.df)
+
+
 class HierarchicalPretrainingDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -965,7 +958,7 @@ class HierarchicalPretrainingDataset(torch.utils.data.Dataset):
         self.transform = transform
 
     def __getitem__(self, idx: int):
-        f = torch.load(self.features_list[idx])
+        f = torch.load(self.features_list[idx], map_location='cpu')
         f = self.transform(f)
         label = torch.zeros(1, 1)
         return f, label
@@ -1028,3 +1021,28 @@ class ImageFolderWithNameDataset(datasets.ImageFolder):
             sample = self.transform(sample)
 
         return sample, fname
+
+
+class PatchDataset(torch.utils.data.Dataset):
+    def __init__(self, wsi_fp, coordinates, backend):
+        _, _, patch_size_resized, patch_level, factor = coordinates[0]
+        self.coordinates =coordinates[:, :2]
+        self.wsi = wsd.WholeSlideImage(wsi_fp, backend=backend)
+        self.patch_spacing = self.wsi.spacings[patch_level]
+        self.resize = (factor != 1)
+        self.width = patch_size_resized
+        self.height = patch_size_resized
+        self.target_width = self.width // factor
+        self.target_height = self.height // factor
+
+    def __len__(self):
+        return len(self.coordinates)
+
+    def __getitem__(self, idx):
+        x, y = self.coordinates[idx]
+        patch = self.wsi.get_patch(x, y, self.width, self.height, spacing=self.patch_spacing, center=False)
+        pil_patch = Image.fromarray(patch).convert("RGB")
+        if self.resize:
+            pil_patch = pil_patch.resize((self.target_width, self.target_height))
+        img = transforms.functional.to_tensor(pil_patch)
+        return img, x, y

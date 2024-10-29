@@ -1,7 +1,7 @@
 test_csv:
 blinded: False
 
-features_root_dir:
+features_dir:
 output_dir: 'output/debug'
 experiment_name: 'inference'
 level: 'global'
@@ -71,8 +71,8 @@ wandb:
   to_log:
     - 'test': ['auc', 'kappa', 'cm']
   group:
-  resume_id:
 
+resume_id:
 hydra:
   run:
     dir: /tmp/hydra_output

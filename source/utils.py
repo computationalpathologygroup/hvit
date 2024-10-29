@@ -113,7 +113,7 @@ def initialize_wandb(
     else:
         tags = [str(t) for t in cfg.wandb.tags]
     config = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    if cfg.wandb.resume_id:
+    if cfg.resume_id:
         run = wandb.init(
             project=cfg.wandb.project,
             entity=cfg.wandb.username,
@@ -122,7 +122,7 @@ def initialize_wandb(
             dir=cfg.wandb.dir,
             config=config,
             tags=tags,
-            id=cfg.wandb.resume_id,
+            id=cfg.resume_id,
             resume="must",
         )
     else:
@@ -144,13 +144,17 @@ def initialize_wandb(
     return run
 
 
-def initialize_df(slide_ids):
+def initialize_df(slide_ids, slide_paths: Optional[List[Path]] = None, segmentation_mask_paths: Optional[List[Path]] = None):
     nslide = len(slide_ids)
     df_dict = {
         "slide_id": slide_ids,
         "process": np.full((nslide), 1, dtype=np.uint8),
         "status": np.full((nslide), "tbp"),
     }
+    if slide_paths is not None:
+        df_dict["slide_path"] = slide_paths
+    if segmentation_mask_paths is not None:
+        df_dict["segmentation_mask_path"] = segmentation_mask_paths
     df = pd.DataFrame(df_dict)
     return df
 
@@ -165,16 +169,28 @@ def extract_coord_from_path(path):
 
 
 def update_state_dict(model_dict, state_dict):
-    success, failure = 0, 0
+    success, shape_mismatch, missing_keys = 0, 0, 0
     updated_state_dict = {}
-    for k, v in zip(model_dict.keys(), state_dict.values()):
-        if v.size() != model_dict[k].size():
-            updated_state_dict[k] = model_dict[k]
-            failure += 1
+    shape_mismatch_list = []
+    missing_keys_list = []
+    for k, v in state_dict.items():
+        if k in model_dict:
+            if v.size() == model_dict[k].size():
+                updated_state_dict[k] = v
+                success += 1
+            else:
+                updated_state_dict[k] = model_dict[k]
+                shape_mismatch += 1
+                shape_mismatch_list.append(k)
         else:
-            updated_state_dict[k] = v
-            success += 1
-    msg = f"{success} weight(s) loaded succesfully ; {failure} weight(s) not loaded because of mismatching shapes"
+            missing_keys += 1
+            missing_keys_list.append(k)
+    if shape_mismatch > 0 or missing_keys > 0:
+        msg = (f"{success}/{len(state_dict)} weight(s) loaded successfully\n"
+           f"{shape_mismatch} weight(s) not loaded due to mismatching shapes: {shape_mismatch_list}\n"
+           f"{missing_keys} key(s) not found in model: {missing_keys_list}")
+    else:
+        msg = f"{success}/{len(state_dict)} weight(s) loaded successfully."
     return updated_state_dict, msg
 
 
@@ -310,8 +326,8 @@ def collate_survival_features(
     elif label_type == "int":
         label = torch.LongTensor([item[2] for item in batch])
     event_time = torch.FloatTensor([item[3] for item in batch])
-    censorship = torch.FloatTensor([item[4] for item in batch])
-    return [idx, feature, label, event_time, censorship]
+    censored = torch.FloatTensor([item[4] for item in batch])
+    return [idx, feature, label, event_time, censored]
 
 
 def collate_survival_features_coords(
@@ -332,8 +348,8 @@ def collate_survival_features_coords(
     elif label_type == "int":
         label = torch.LongTensor([item[3] for item in batch])
     event_time = torch.FloatTensor([item[4] for item in batch])
-    censorship = torch.FloatTensor([item[5] for item in batch])
-    return [idx, feature, coords, label, event_time, censorship]
+    censored = torch.FloatTensor([item[5] for item in batch])
+    return [idx, feature, coords, label, event_time, censored]
 
 
 def collate_features_and_num_regions(batch, label_type: str = "int"):
@@ -355,6 +371,24 @@ def collate_region_filepaths(batch):
     sid = item[2]
     pct = item[3]
     return [idx, fp, sid, pct]
+
+
+def collate_filepaths(batch):
+    item = batch[0]
+    idx = torch.LongTensor([item[0]])
+    slide_fp = Path(item[1])
+    mask_fp = None
+    if item[2] is not None:
+        mask_fp = Path(item[2])
+    return [idx, slide_fp, mask_fp]
+
+
+def collate_coordinates(batch):
+    item = batch[0]
+    idx = torch.LongTensor([item[0]])
+    slide_fp = Path(item[1])
+    coordinates = item[2]
+    return [idx, slide_fp, coordinates]
 
 
 def get_roc_auc_curve(
@@ -510,6 +544,15 @@ def custom_isup_grade_dist(x: int, y: int):
         return abs(x - y)
 
 
+def build_slide_level_feature(region_feature_paths):
+    region_features = []
+    for fp in sorted(region_feature_paths):
+        f = torch.load(fp)
+        region_features.append(f)
+    feature = torch.stack(region_features, dim=0).squeeze(1)
+    return feature
+
+
 def get_majority_vote(
     preds, distance_func: Optional[Callable] = None, nfold: int = 5, seed: int = 0
 ):
@@ -554,6 +597,13 @@ def update_log_dict(
             log_dict.update({f"{prefix}/{r}": v})
 
 
+def sort_coords(coords):
+    mock_filenames = [f"{x}_{y}.jpg" for x, y in coords]
+    sorted_filenames = sorted(mock_filenames)
+    sorted_coords = [(int(name.split('_')[0]), int(name.split('_')[1].split('.')[0])) for name in sorted_filenames]
+    return sorted_coords
+
+
 def make_weights_for_balanced_classes(dataset):
     n_samples = len(dataset)
     weight_per_class = []
@@ -590,7 +640,7 @@ def get_label_from_regression_logits(logits, num_classes):
 
 
 def aggregated_cindex(df: pd.DataFrame, label_name: str = "label", agg: str = "mean"):
-    censorships = df.groupby("case_id").censorship.first()
+    censoring = df.groupby("case_id").censored.first()
     event_times = df.groupby("case_id")[label_name].first()
     if agg == "mean":
         risk_scores = df.groupby("case_id").risk.mean()
@@ -599,7 +649,7 @@ def aggregated_cindex(df: pd.DataFrame, label_name: str = "label", agg: str = "m
     else:
         raise ValueError(f"agg ({agg}) argument not supported")
     c_index = concordance_index_censored(
-        [bool(1 - c) for c in censorships],
+        [bool(1 - c) for c in censoring],
         event_times,
         risk_scores,
         tied_tol=1e-08,
@@ -610,7 +660,7 @@ def aggregated_cindex(df: pd.DataFrame, label_name: str = "label", agg: str = "m
 def get_cumulative_dynamic_auc(
     train_df, test_df, risks, label_name, verbose: bool = False
 ):
-    cols = ["censorship", label_name]
+    cols = ["censored", label_name]
     train_tuples = train_df[cols].values
     tune_tuples = test_df[cols].values
     survival_train = np.array(
@@ -1741,7 +1791,7 @@ def train_survival(
 
     model.train()
     epoch_loss = 0
-    censorships, event_times = [], []
+    censoring, event_times = [], []
     risk_scores, labels = [], []
     idxs = []
 
@@ -1782,7 +1832,7 @@ def train_survival(
     ) as t:
         for i, batch in enumerate(t):
             if dataset.use_coords:
-                idx, x, coords, label, event_time, c = batch
+                idx, x, coords, label, event_time, censored = batch
                 if agg_method == "concat":
                     x, coords = x.to(device, non_blocking=True), coords.to(
                         device, non_blocking=True
@@ -1791,7 +1841,7 @@ def train_survival(
                     x = [f.to(device, non_blocking=True) for f in x[0]]
                     coords = [c.to(device, non_blocking=True) for c in coords[0]]
             else:
-                idx, x, label, event_time, c = batch
+                idx, x, label, event_time, censored = batch
                 if agg_method == "self_att":
                     x = [
                         xx[j].to(device, non_blocking=True)
@@ -1800,7 +1850,7 @@ def train_survival(
                     ]
                 else:
                     x = x.to(device, non_blocking=True)
-            label, c = label.to(device, non_blocking=True), c.to(
+            label, censored = label.to(device, non_blocking=True), censored.to(
                 device, non_blocking=True
             )
 
@@ -1812,14 +1862,14 @@ def train_survival(
             hazards = torch.sigmoid(logits)  # [1, nbins]
             surv = torch.cumprod(1 - hazards, dim=1)  # [1, nbins]
 
-            loss = criterion(hazards, surv, label, c)
+            loss = criterion(hazards, surv, label, censored)
 
             loss_value = loss.item()
             epoch_loss += loss_value
 
             risk = -torch.sum(surv, dim=1).detach()  # [1]
             risk_scores.append(risk.item())
-            censorships.append(c.item())
+            censoring.append(censored.item())
             event_times.append(event_time.item())
 
             if gradient_accumulation:
@@ -1840,7 +1890,7 @@ def train_survival(
     dataset.df.loc[idxs, "risk"] = risk_scores
 
     c_index = concordance_index_censored(
-        [bool(1 - c) for c in censorships],
+        [bool(1 - c) for c in censoring],
         event_times,
         risk_scores,
         tied_tol=1e-08,
@@ -1867,7 +1917,7 @@ def tune_survival(
 
     model.eval()
     epoch_loss = 0
-    censorships, event_times = [], []
+    censoring, event_times = [], []
     risk_scores, labels = [], []
     idxs = []
 
@@ -1902,7 +1952,7 @@ def tune_survival(
         with torch.no_grad():
             for i, batch in enumerate(t):
                 if dataset.use_coords:
-                    idx, x, coords, label, event_time, c = batch
+                    idx, x, coords, label, event_time, censored = batch
                     if agg_method == "concat":
                         x, coords = x.to(device, non_blocking=True), coords.to(
                             device, non_blocking=True
@@ -1911,7 +1961,7 @@ def tune_survival(
                         x = [f.to(device, non_blocking=True) for f in x[0]]
                         coords = [c.to(device, non_blocking=True) for c in coords[0]]
                 else:
-                    idx, x, label, event_time, c = batch
+                    idx, x, label, event_time, censored = batch
                     if agg_method == "self_att":
                         x = [
                             xx[j].to(device, non_blocking=True)
@@ -1920,7 +1970,7 @@ def tune_survival(
                         ]
                     else:
                         x = x.to(device, non_blocking=True)
-                label, c = label.to(device, non_blocking=True), c.to(
+                label, censored = label.to(device, non_blocking=True), censored.to(
                     device, non_blocking=True
                 )
 
@@ -1932,12 +1982,12 @@ def tune_survival(
                 hazards = torch.sigmoid(logits)
                 surv = torch.cumprod(1 - hazards, dim=1)
 
-                loss = criterion(hazards, surv, label, c, alpha=0)
+                loss = criterion(hazards, surv, label, censored, alpha=0)
                 epoch_loss += loss.item()
 
                 risk = -torch.sum(surv, dim=1).detach()
                 risk_scores.append(risk.item())
-                censorships.append(c.item())
+                censoring.append(censored.item())
                 event_times.append(event_time.item())
 
                 labels.extend(label.clone().tolist())
@@ -1946,7 +1996,7 @@ def tune_survival(
     dataset.df.loc[idxs, "risk"] = risk_scores
 
     c_index = concordance_index_censored(
-        [bool(1 - c) for c in censorships],
+        [bool(1 - c) for c in censoring],
         event_times,
         risk_scores,
         tied_tol=1e-08,
@@ -1971,7 +2021,7 @@ def test_survival(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model.eval()
-    censorships, event_times = [], []
+    censoring, event_times = [], []
     risk_scores = []
     idxs = []
 
@@ -2006,7 +2056,7 @@ def test_survival(
         with torch.no_grad():
             for i, batch in enumerate(t):
                 if dataset.use_coords:
-                    idx, x, coords, _, event_time, c = batch
+                    idx, x, coords, _, event_time, censored = batch
                     if agg_method == "concat":
                         x, coords = x.to(device, non_blocking=True), coords.to(
                             device, non_blocking=True
@@ -2015,7 +2065,7 @@ def test_survival(
                         x = [f.to(device, non_blocking=True) for f in x[0]]
                         coords = [c.to(device, non_blocking=True) for c in coords[0]]
                 else:
-                    idx, x, _, event_time, c = batch
+                    idx, x, _, event_time, censored = batch
                     if agg_method == "self_att":
                         x = [
                             xx[j].to(device, non_blocking=True)
@@ -2024,7 +2074,7 @@ def test_survival(
                         ]
                     else:
                         x = x.to(device, non_blocking=True)
-                c = c.to(device, non_blocking=True)
+                censored = censored.to(device, non_blocking=True)
 
                 if dataset.use_coords:
                     logits = model(x, coords)
@@ -2036,7 +2086,7 @@ def test_survival(
 
                 risk = -torch.sum(surv, dim=1).detach()
                 risk_scores.append(risk.item())
-                censorships.append(c.item())
+                censoring.append(censored.item())
                 event_times.append(event_time.item())
 
                 idxs.extend(list(idx))
@@ -2044,7 +2094,7 @@ def test_survival(
     dataset.df.loc[idxs, "risk"] = risk_scores
 
     c_index = concordance_index_censored(
-        [bool(1 - c) for c in censorships],
+        [bool(1 - c) for c in censoring],
         event_times,
         risk_scores,
         tied_tol=1e-08,
